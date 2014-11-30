@@ -12,7 +12,7 @@ setup(
     ],
     install_requires = [
         "django>=1.4",
-        "pyinotify>=0.9.4",
+        "watchdog>=0.8.2",
         "stylus>=0.1.1"
     ],
     long_description=open('README.md').read(),

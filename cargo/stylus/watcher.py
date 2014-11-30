@@ -1,65 +1,27 @@
-'''
-    Low level inotify wrapper
-'''
-
-from os import read, close
-from struct import unpack
-from fcntl import ioctl
-from termios import FIONREAD
-from time import sleep
-from ctypes import cdll, c_int, POINTER
-from errno import errorcode
-
-
-from os import listdir
-from os.path import join as opj, normpath, isdir
-from threading import Thread, RLock
-from Queue import Queue
-from time import sleep
-
 import os
 import sys
 import time
 import logging
 import signal
-# from watchdog.observers import Observer
-# from watchdog.events import LoggingEventHandler, PatternMatchingEventHandler, FileSystemEventHandler, FileMovedEvent
-import tempfile
 
-import pyinotify
+from watchdog.observers import Observer
+from watchdog.events import LoggingEventHandler, FileSystemEventHandler
+
+from django import conf
 from django.conf import settings
 from django.utils.module_loading import import_module
 from django.db.models import get_models, get_app
 
 import subprocess
 
-pyinotify.max_queued_events.value = 100000
-pyinotify.max_user_watches.value = 100000
+class EventHandler(FileSystemEventHandler):
 
+    def __init__(self, watcher, *args, **kwargs):
+        self.watcher = watcher
 
-pyinotify.SysCtlINotify.inotify_attrs['max_user_watches'] = 100000
+    def on_any_event(self, event):
+        self.watcher.process_changes(event)
 
-
-mask = pyinotify.IN_DELETE | pyinotify.IN_CREATE | pyinotify.IN_MOVED_TO | pyinotify.IN_MODIFY  # watched events
-
-class EventHandler(pyinotify.ProcessEvent):
-
-    def __init__(self, manager, *args, **kwargs):
-        self.manager = manager
-
-    # def process_IN_CREATE(self, event):
-    #     print "Create: %s" %  os.path.join(event.path, event.name)
-
-    # def process_IN_DELETE(self, event):
-    #     print "Remove: %s" %  os.path.join(event.path, event.name)
-
-    # def process_IN_MODIFY(self, event):
-    #     print "Modify: %s" %  os.path.join(event.path, event.name)
-
-    # Atomic save
-    def process_IN_MOVED_TO(self, event):
-        print "Moved: %s" %  os.path.join(event.path, event.name)
-        self.manager.process_changes(event)
 
 class Watcher(object):
     handler = None
@@ -71,23 +33,27 @@ class Watcher(object):
     def __init__(self, command=None, *args, **kwargs):
         #self.handler = WatcherHandler(self)
         self.command = command
-        self.manager = pyinotify.WatchManager()
-        self.notifier = pyinotify.Notifier(self.manager, EventHandler(self))
+        self.observer = Observer()
+        self.event_handler = EventHandler(self)
 
+
+        # self.notifier.max_user_watches=16384
         self.process_settings()
 
-        self.notifier.max_user_watches=16384
-        self.process_settings()
+        app_root = os.path.abspath(settings.SITE_ROOT)
 
-        paths = self.get_watched_paths()
-        for appname, path in paths:
+        self.observer.schedule(self.event_handler, app_root, recursive=True)
+        self.print_head('Watching \033[94m%s\033[0m' % (app_root))
 
-            #try:
-            #self.schedule(self.handler, path, recursive=True)
-            self.schedule(path, self.process_changes, 'MODIFY')
-            self.print_head('Watching \033[94m%s\033[0m' % (appname))
-            # except Exception, e:
-            #     self.print_error('Watching %s error : %s' % (appname, str(e)))
+        # paths = self.get_watched_paths()
+        # for appname, path in paths:
+
+        #     #try:
+        #     #self.schedule(self.handler, path, recursive=True)
+        #     self.schedule(path, 'MODIFY')
+        #     self.print_head('Watching \033[94m%s\033[0m' % (appname))
+        #     # except Exception, e:
+        #     #     self.print_error('Watching %s error : %s' % (appname, str(e)))
 
 
     def process_settings(self):
@@ -96,12 +62,12 @@ class Watcher(object):
         self.configs = []
         settings = conf.settings
 
-        if not hasattr(settings, 'CARGO_STYLUS') and 'watcher' in settings.CARGO_STYLUS:
-            self.print_error('Improprely config for cargo stylus watcher : missing settings.CARGO_STYLUS["watcher"]')
+        if not hasattr(settings, 'CARGO_STYLUS') and 'watchers' in settings.CARGO_STYLUS:
+            self.print_error('Improprely config for cargo stylus watchers : missing settings.CARGO_STYLUS["watchers"]')
         else:
-            configs = settings.CARGO_STYLUS['watcher']
+            configs = settings.CARGO_STYLUS['watchers']
 
-            try
+            try:
                 from cargo import admin
                 configs.append(
                     (
@@ -141,23 +107,29 @@ class Watcher(object):
 
                     if source and css_output:
                         self.configs.append((source, css_output, content))
-                except:
-                    self.print_error('Invalid config for cargo stylus watcher "%s"' % config)
+                except Exception, e:
+                    # print config
+                    self.print_error(u'Invalid config for cargo stylus watchers "%s"' % (e.message))
 
     def process_changes(self, event):
 
+
+        print "EVent: %s %s" %  (event.event_type, event.src_path)
+        if event.dest_path:
+            print event.dest_path
         if event.pathname.endswith('.styl'):
+            self.generate_css()
+            return
 
-            self.process_settings()
-            diff_cmd_stream = os.popen("git diff --name-only")
-            diffs = diff_cmd_stream.read()
+            # self.process_settings()
+            # diff_cmd_stream = os.popen("git diff --name-only")
+            # diffs = diff_cmd_stream.read()
 
-            if ".styl" in diffs:
-                self.print_head('Changes detected')
-                self.generate_css()
+            # if ".styl" in diffs:
+            #     self.print_head('Changes detected')
 
-            else:
-                self.print_head("No changes")
+            # else:
+            #     self.print_head("No changes")
 
     def generate_css(self, compress=True):
 
@@ -214,12 +186,17 @@ import_app(appname)
             if csslen == 0 or errors:
                 self.print_error("^ Error in stylus compilation")
             else:
-                # self.print_success("Done (%s chars)." % csslen)
-                f = open(css_output, 'w')
-                #self.print_process('Pushing css into %s' % css_output)
-                f.write(css)
-                f.close()
-                self.print_success("Done (git commit to stop watching those changes)")
+                if css != config[2]:
+                    # self.print_success("Done (%s chars)." % csslen)
+                    f = open(css_output, 'w')
+                    #self.print_process('Pushing css into %s' % css_output)
+                    f.write(css)
+                    f.close()
+                    config[2] = css
+                    self.print_success("Done.")
+                else:
+                    self.print_success("No changes, abort.")
+
             #except Exception, e:
                 #self.print_error('Error during css generation for "%s" : %s' % (config, str(e)))
 
@@ -268,21 +245,17 @@ import_app(appname)
                     format='%(asctime)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S')
 
-        while True:  # loop forever
-            try:
-                # process the queue of events as explained above
-                self.notifier.loop()
-                # you can do some tasks here...
-            except KeyboardInterrupt:
-                # destroy the inotify's instance on this interrupt (stop monitoring)
-                self.notifier.stop()
-                break
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.observer.stop()
+        self.observer.join()
 
 
 
-    def schedule(self, path, event_handle, event_type="MODIFY"):
-        if event_type == "MODIFY":
-            self.manager.add_watch(path, mask, rec=True)
+    def schedule(self, path, event_type="MODIFY"):
+
         pass
 
     def print_r(self, pattern, str):
